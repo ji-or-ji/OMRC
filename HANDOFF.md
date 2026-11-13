@@ -19,10 +19,11 @@
 | 项 | 状态 |
 |---|---|
 | 仓库 | 已建，双远端 |
-| W1a | **已打通**：抓屏 → 硬件编码 → UDP → 重组 → 解码 → 上屏，1920×1080、37~41 fps、端到端 37ms |
+| W1a | **已打通**：抓屏 → 硬件编码 → UDP → 重组 → 解码 → 上屏，1920×1080、35~43 fps、端到端 37~40ms |
+| 丢包补救 | 已做：NACK 重传两轮，救不回来才要 IDR；5% 人为丢包下解码零报错 |
+| 断线重建 | 已做：切分辨率 / 全屏独占 / 锁屏导致复制断开后自动重建全链路 |
 | 代码 | 可编译、可测试、可运行 |
-| 环境 | Rust + VS Build Tools + Windows SDK 就绪 |
-| Android SDK / NDK | **未装**，W1b 需要 |
+| 环境 | Rust + VS Build Tools + Windows SDK + **Android SDK/NDK + cargo-ndk** 就绪 |
 | Godot | **未装**，W2 才需要 |
 
 远端：
@@ -118,17 +119,13 @@ W1a 的验收已经过了（硬件路径 37ms < 80ms）。接下来两条路，�
 
 **W1b：安卓端**
 
-1. 装 Android SDK + NDK（见 `docs/04-环境清单.md`）
-2. `rustup target add aarch64-linux-android x86_64-linux-android`
-3. `cargo install cargo-ndk`
-4. 最小 Android 工程：Activity + SurfaceView + MediaCodec 异步模式
-5. `cargo ndk` 编出 `.so`，JNI 桥接
+环境已经齐了（SDK/NDK/cargo-ndk 已装并实测能出 .so），可以直接开工：
 
-**W1a 还剩的收尾（可选，不急）**
+1. 最小 Android 工程：Activity + SurfaceView + MediaCodec 异步模式
+2. 把 `omrc-core` + `omrc-transport-lan` 编成 cdylib，JNI 桥接
+3. 先用模拟器（x86_64）验流程，再上真机（arm64-v8a）
 
-- NACK 与关键帧请求：`Reassembler::missing()` 和 `Encoder::request_keyframe()` 都已就位，缺一条回传链路
-- 复制链路断开（切分辨率 / 全屏独占 / 锁屏）后自动重建，现在直接退出
-- 多显示器、负坐标
+注意 AI 侧没有安卓真机，真机验证要季来做；模拟器能先验证「收包 → 硬解 → Surface 上屏」这条。
 
 ### Rust 依赖现状
 
