@@ -35,7 +35,7 @@ use windows::Win32::Media::MediaFoundation::{
     MFVideoFormat_H264, MFVideoFormat_NV12, MFVideoInterlace_Progressive,
     MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_INTERLACE_MODE,
     MF_MT_MAJOR_TYPE, MF_MT_MPEG2_PROFILE, MF_MT_MPEG_SEQUENCE_HEADER, MF_MT_PIXEL_ASPECT_RATIO,
-    MF_MT_SUBTYPE, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_SA_D3D11_AWARE, MF_TRANSFORM_ASYNC,
+    MF_MT_SUBTYPE, MF_E_NOTACCEPTING, MF_E_TRANSFORM_NEED_MORE_INPUT, MF_SA_D3D11_AWARE, MF_TRANSFORM_ASYNC,
     MF_TRANSFORM_ASYNC_UNLOCK,
     MFCreateMediaType,
     MFCreateMemoryBuffer, MFCreateSample, MFTEnumEx, eAVEncCommonRateControlMode_CBR,
@@ -64,8 +64,12 @@ pub struct Encoder {
     bitrate: u32,
     /// SPS / PPS。有些 MFT 不在码流里带，关键帧要自己补。
     seq_header: Vec<u8>,
-    /// 异步 MFT 的输入闸门。
+    /// 异步 MFT 的输入闸门（只用于诊断，不再拿它堵帧）。
     can_input: bool,
+    /// 已喂进去、还没取出来的帧数。
+    pending_inputs: u32,
+    /// 因为编码器没空而丢掉的帧数。
+    pub dropped: u64,
     /// 异步 MFT 是否对外提供输出样本。
     provides_samples: bool,
     nv12_len: usize,
@@ -227,6 +231,8 @@ impl Encoder {
             bitrate: cfg.bitrate_bps,
             seq_header: Vec::new(),
             can_input: true,
+            pending_inputs: 0,
+            dropped: 0,
             provides_samples: false,
             nv12_len: (cfg.width as usize * cfg.height as usize * 3) / 2,
             keyframe_pending: false,
@@ -423,13 +429,8 @@ impl Encoder {
         }
 
         if self.mode == EncoderMode::AsyncHardware {
-            // 异步 MFT 的规矩：只有在它要输入的时候才能喂。
+            // 先把已到的事件取干净（清空队列，不影响是否喂入）。
             self.pump(pts_us, &mut out)?;
-            if !self.can_input {
-                // 它还在消化上一帧，这一帧先不喂。实时流宁丢勿积。
-                tracing::debug!("编码器未就绪，丢一帧");
-                return Ok(out);
-            }
         }
 
         if self.keyframe_pending {
@@ -437,8 +438,22 @@ impl Encoder {
             self.keyframe_pending = false;
         }
 
-        unsafe { self.transform.ProcessInput(0, &sample, 0) }
-            .context("ProcessInput 失败")?;
+        // 不再看 METransformNeedInput 的脸色：那是异步 MFT 的礼貌，
+        // 一旦对面不发事件（驱动抽风、我们漏读一个），等它就是死锁。
+        // 直接喂，忙就丢一帧，实时流本来就不该排长队。
+        match unsafe { self.transform.ProcessInput(0, &sample, 0) } {
+            Ok(()) => {
+                self.pending_inputs += 1;
+                self.can_input = false;
+            }
+            Err(e) if e.code() == MF_E_NOTACCEPTING => {
+                self.dropped += 1;
+                tracing::debug!("编码器还在消化上一帧，丢一帧");
+                return Ok(out);
+            }
+            Err(e) => return Err(e).context("ProcessInput 失败"),
+        }
+
         if self.mode == EncoderMode::AsyncHardware {
             self.can_input = false;
             // 异步 MFT 必须等 METransformHaveOutput 事件才能取输出，
@@ -504,7 +519,7 @@ impl Encoder {
         Ok(())
     }
 
-    fn drain(&self, _pts_us: i64, out: &mut Vec<EncodedFrame>) -> Result<()> {
+    fn drain(&mut self, _pts_us: i64, out: &mut Vec<EncodedFrame>) -> Result<()> {
         loop {
             let sample = if self.provides_samples {
                 None
@@ -533,6 +548,9 @@ impl Encoder {
                 // NVIDIA 的 MFT 在没有待输出帧时会丢一个 E_UNEXPECTED 出来，
                 // 而不是规范里的 NEED_MORE_INPUT。没喂过帧就当成“没东西可拿”。
                 if e.code() == windows::Win32::Foundation::E_UNEXPECTED {
+                    if self.pending_inputs > 0 {
+                        tracing::warn!(pending = self.pending_inputs, "编码器返回 E_UNEXPECTED");
+                    }
                     return Ok(());
                 }
             }
@@ -548,6 +566,7 @@ impl Encoder {
                 Some(s) => s,
                 None => return Ok(()),
             };
+            self.pending_inputs = self.pending_inputs.saturating_sub(1);
 
             let data = sample_bytes(&produced)?;
             if data.is_empty() {

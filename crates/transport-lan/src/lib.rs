@@ -25,7 +25,7 @@
 //! 32    ...   载荷，最大 MTU - 32 = 1168 字节
 //! ```
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use omrc_core::proto::ControlMessage;
 use omrc_core::transport::EncodedFrame;
@@ -110,6 +110,160 @@ pub struct CompletedFrame {
     pub pts_us: u64,
     pub keyframe: bool,
     pub data: Vec<u8>,
+}
+
+/// 一帧还没凑齐的帧。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pending {
+    pub frame_id: u64,
+    pub keyframe: bool,
+    pub missing: Vec<u16>,
+}
+
+/// 丢包补救的决策。收端拿着它去发控制包。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LossAction {
+    /// 请求重发这些分片。
+    Nack { frame_id: u64, slices: Vec<u16> },
+    /// 放弃这一帧（重组器里会把它拿走）。
+    Drop { frame_id: u64 },
+    /// 重传也救不回来了，向主机要一个关键帧。
+    RequestKeyframe,
+}
+
+/// 丢包补救策略。
+///
+/// 内网 RTT 低于 1ms，“补一片”远比“等下一个 IDR”便宜，所以默认先补两次，
+/// 补不回来才放弃。放弃关键帧、或者连续丢得太密，就直接要 IDR。
+#[derive(Debug)]
+pub struct LossTracker {
+    attempts: HashMap<u64, u8>,
+    /// 已经放弃的帧。晚到的片会把帧“复活”，不复活就不会反复要重传。
+    abandoned: HashSet<u64>,
+    abandon_order: VecDeque<u64>,
+    newest_seen: u64,
+    newest_completed: u64,
+    max_attempts: u8,
+    lost_before_idr: u32,
+    lost_since_idr: u32,
+    last_idr_request: Option<u64>,
+    pub lost: u64,
+    pub nacked: u64,
+    pub idr_requested: u64,
+}
+
+impl Default for LossTracker {
+    fn default() -> Self {
+        Self::new(2, 3)
+    }
+}
+
+impl LossTracker {
+    pub fn new(max_attempts: u8, lost_before_idr: u32) -> Self {
+        Self {
+            attempts: HashMap::new(),
+            abandoned: HashSet::new(),
+            abandon_order: VecDeque::new(),
+            newest_seen: 0,
+            newest_completed: 0,
+            max_attempts: max_attempts.max(1),
+            lost_before_idr: lost_before_idr.max(1),
+            lost_since_idr: 0,
+            last_idr_request: None,
+            lost: 0,
+            nacked: 0,
+            idr_requested: 0,
+        }
+    }
+
+    /// 这帧是不是已经被放弃了。晚到的包不应该再进重组器。
+    pub fn is_abandoned(&self, frame_id: u64) -> bool {
+        self.abandoned.contains(&frame_id)
+    }
+
+    fn abandon(&mut self, frame_id: u64) {
+        if self.abandoned.insert(frame_id) {
+            self.abandon_order.push_back(frame_id);
+            while self.abandon_order.len() > 256 {
+                if let Some(old) = self.abandon_order.pop_front() {
+                    self.abandoned.remove(&old);
+                }
+            }
+        }
+    }
+
+    /// 看到一帧的包（不一定完整）。
+    pub fn observe(&mut self, frame_id: u64) {
+        self.newest_seen = self.newest_seen.max(frame_id);
+    }
+
+    /// 重组出了一帧完整帧。
+    pub fn observe_completed(&mut self, frame_id: u64) {
+        self.newest_completed = self.newest_completed.max(frame_id);
+        self.newest_seen = self.newest_seen.max(frame_id);
+        self.attempts.remove(&frame_id);
+    }
+
+    /// 收到关键帧，重置计数。
+    pub fn on_keyframe(&mut self) {
+        self.lost_since_idr = 0;
+    }
+
+    /// 检查有没有已经确认救不回来的帧，给出该发什么。
+    ///
+    /// “确认救不回来”有两个口径，满足其一就动手：
+    /// 1. 更靠后的帧已经完整重组出来了；
+    /// 2. 后面的帧号已经超过它三条以上（碎片来晚了也不救）。
+    pub fn poll(&mut self, reasm: &mut Reassembler) -> Vec<LossAction> {
+        let mut out = Vec::new();
+        if self.newest_seen == 0 {
+            return out;
+        }
+
+        for p in reasm.outstanding() {
+            let superseded = self.newest_completed > p.frame_id;
+            let too_late = self.newest_seen > p.frame_id + 3;
+            if !superseded && !too_late {
+                continue;
+            }
+
+            let attempt = self.attempts.entry(p.frame_id).or_insert(0);
+            if *attempt < self.max_attempts {
+                *attempt += 1;
+                self.nacked += 1;
+                out.push(LossAction::Nack {
+                    frame_id: p.frame_id,
+                    slices: p.missing,
+                });
+                continue;
+            }
+
+            // 补不回来了，放弃。
+            self.attempts.remove(&p.frame_id);
+            reasm.drop_frame(p.frame_id);
+            self.abandon(p.frame_id);
+            self.lost += 1;
+            self.lost_since_idr += 1;
+            out.push(LossAction::Drop {
+                frame_id: p.frame_id,
+            });
+
+            if p.keyframe || self.lost_since_idr >= self.lost_before_idr {
+                // 关键帧丢了，或者连着丢太多，后面的参考链已经废了。
+                if self
+                    .last_idr_request
+                    .map(|last| self.newest_seen.saturating_sub(last) >= 5)
+                    .unwrap_or(true)
+                {
+                    self.last_idr_request = Some(self.newest_seen);
+                    self.idr_requested += 1;
+                    self.lost_since_idr = 0;
+                    out.push(LossAction::RequestKeyframe);
+                }
+            }
+        }
+        out
+    }
 }
 
 /// 一个编码帧需要切成多少片。
@@ -289,6 +443,27 @@ impl Reassembler {
                 .map(|(i, _)| i as u16)
                 .collect(),
         }
+    }
+
+    /// 所有还没凑齐的帧，按帧号升序。
+    pub fn outstanding(&self) -> Vec<Pending> {
+        let mut v: Vec<Pending> = self
+            .frames
+            .iter()
+            .map(|(id, buf)| Pending {
+                frame_id: *id,
+                keyframe: buf.keyframe,
+                missing: buf
+                    .parts
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| p.is_none())
+                    .map(|(i, _)| i as u16)
+                    .collect(),
+            })
+            .collect();
+        v.sort_by_key(|p| p.frame_id);
+        v
     }
 
     /// 主动放弃一帧。收到更新的关键帧后调用，省得为旧帧白等。
@@ -498,6 +673,96 @@ mod tests {
         assert_eq!(done.frame_id, 9001);
         assert_eq!(ControlMessage::decode(&done.data), Some(msg));
         assert_eq!(video.inflight(), 0);
+    }
+
+    #[test]
+    fn 缺片先请求重传补回来() {
+        let f = frame(10, MAX_PAYLOAD * 4, true);
+        let pkts = fragment(&f);
+        let next = frame(11, MAX_PAYLOAD * 2, false);
+
+        let mut r = Reassembler::default();
+        let mut tracker = LossTracker::default();
+        tracker.observe(10);
+        for (i, p) in pkts.iter().enumerate() {
+            if i == 2 {
+                continue;
+            }
+            r.push(p);
+        }
+        // 后面一帧完整到了，帧 10 就算“确定缺片”
+        for p in fragment(&next) {
+            tracker.observe(11);
+            if r.push(&p).is_some() {
+                tracker.observe_completed(11);
+            }
+        }
+
+        let actions = tracker.poll(&mut r);
+        assert_eq!(
+            actions,
+            vec![LossAction::Nack {
+                frame_id: 10,
+                slices: vec![2]
+            }]
+        );
+
+        // 补发后能重组
+        let done = r.push(&pkts[2]).expect("补上就能重组");
+        assert_eq!(done.data, f.data);
+        assert_eq!(tracker.lost, 0);
+    }
+
+    #[test]
+    fn 补不回来就放弃并请求关键帧() {
+        let f = frame(20, MAX_PAYLOAD * 4, true);
+        let pkts = fragment(&f);
+        let next = frame(21, MAX_PAYLOAD * 2, false);
+
+        let mut r = Reassembler::default();
+        let mut tracker = LossTracker::new(2, 3);
+        tracker.observe(20);
+        for (i, p) in pkts.iter().enumerate() {
+            if i == 1 {
+                continue;
+            }
+            r.push(p);
+        }
+        for p in fragment(&next) {
+            tracker.observe(21);
+            if r.push(&p).is_some() {
+                tracker.observe_completed(21);
+            }
+        }
+
+        // 第一轮：请求重传
+        assert!(matches!(
+            tracker.poll(&mut r).as_slice(),
+            [LossAction::Nack { .. }]
+        ));
+        // 第二轮：再请求一次
+        assert!(matches!(
+            tracker.poll(&mut r).as_slice(),
+            [LossAction::Nack { .. }]
+        ));
+        // 第三轮：放弃，并且因为丢的是关键帧，要 IDR
+        let actions = tracker.poll(&mut r);
+        assert!(actions.contains(&LossAction::Drop { frame_id: 20 }));
+        assert!(actions.contains(&LossAction::RequestKeyframe));
+        assert_eq!(tracker.lost, 1);
+        assert_eq!(r.inflight(), 0);
+    }
+
+    #[test]
+    fn 紧跟的帧不会被误判为丢失() {
+        let f = frame(30, MAX_PAYLOAD * 3, false);
+        let pkts = fragment(&f);
+        let mut r = Reassembler::default();
+        let mut tracker = LossTracker::default();
+        tracker.observe(30);
+        // 只到了第 0 片，后面还可能在路上
+        r.push(&pkts[0]);
+        assert!(tracker.poll(&mut r).is_empty());
     }
 
     #[test]

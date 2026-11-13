@@ -16,14 +16,15 @@ mod mft;
 mod overlay;
 mod video_proc;
 
+use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use capture::Acquire;
 use omrc_core::proto::ControlMessage;
 use omrc_core::video::{Codec, EncodeConfig};
-use omrc_transport_lan::{fragment, fragment_control};
+use omrc_transport_lan::{Reassembler, fragment, fragment_control};
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
 use windows::Win32::Media::MediaFoundation::{MFStartup, MFShutdown, MF_VERSION, MFSTARTUP_FULL};
 
@@ -201,18 +202,7 @@ fn play(args: &[String]) -> Result<()> {
     println!("编码器：{:?}", encoder.mode());
 
     // 硬件编码器要的是显存里的 NV12 纹理；软件编码器退而求其次吃系统内存。
-    let converter = if encoder.wants_texture() {
-        Some(video_proc::Nv12Converter::new(
-            dupl.device(),
-            dupl.context(),
-            dupl.target(),
-            dupl.width(),
-            dupl.height(),
-            fps,
-        )?)
-    } else {
-        None
-    };
+    let mut converter = build_converter(&dupl, &encoder, fps)?;
 
     let overlay_width = 340;
     let overlay_height = 56;
@@ -222,12 +212,20 @@ fn play(args: &[String]) -> Result<()> {
     socket.connect(peer).context("connect 到对端失败")?;
     // 视频包一帧几十个，发送缓冲开大点，别在 127.0.0.1 上自己堵自己。
     let _ = socket.set_write_timeout(Some(Duration::from_millis(2)));
+    // 控制回传（NACK / 要 IDR）是非阻塞读的，不占主循环。
+    socket.set_nonblocking(true).context("设置非阻塞失败")?;
 
     tracing::info!(%peer, "开始推流");
 
     let mut nv12 = Vec::new();
     let mut frame_id = 0u64;
     let mut control_id = 1_000_000u64;
+    // 最近几帧的分片，留着给 NACK 重传。
+    let mut resend_cache: VecDeque<(u64, Vec<Vec<u8>>)> = VecDeque::new();
+    let mut ctrl_reasm = Reassembler::new(4);
+    let mut ctrl_buf = [0u8; 2048];
+    let mut stat_resends = 0u64;
+    let mut stat_nacks = 0u64;
     let mut stat_frames = 0u64;
     let mut stat_captured = 0u64;
     let mut stat_bytes = 0u64;
@@ -242,6 +240,39 @@ fn play(args: &[String]) -> Result<()> {
     loop {
         if seconds > 0 && started.elapsed() >= Duration::from_secs(seconds) {
             break;
+        }
+
+        // 先把收端发来的控制包收干净（NACK、要 IDR）。非阻塞，不影响主循环。
+        // 每轮最多收 64 个：万一对面在刷控制包，主循环也得继续跑。
+        for _ in 0..64 {
+            let Ok(n) = socket.recv(&mut ctrl_buf) else {
+                break;
+            };
+            let Some(frame) = ctrl_reasm.push_control(&ctrl_buf[..n]) else {
+                continue;
+            };
+            let Some(msg) = ControlMessage::decode(&frame.data) else {
+                continue;
+            };
+            match msg {
+                ControlMessage::Nack { frame_id, slices } => {
+                    stat_nacks += 1;
+                    if let Some((_, pkts)) = resend_cache.iter().find(|(id, _)| *id == frame_id)
+                    {
+                        for s in slices {
+                            if let Some(pkt) = pkts.get(s as usize) {
+                                let _ = socket.send(pkt);
+                                stat_resends += 1;
+                            }
+                        }
+                    }
+                }
+                ControlMessage::RequestKeyframe => {
+                    tracing::debug!("收端请求关键帧");
+                    encoder.request_keyframe();
+                }
+                _ => {}
+            }
         }
 
         let t0 = Instant::now();
@@ -282,15 +313,29 @@ fn play(args: &[String]) -> Result<()> {
 
                 for f in &frames {
                     let mut sent = 0usize;
-                    for pkt in fragment(f) {
-                        match socket.send(&pkt) {
+                    let pkts = fragment(f);
+                    for pkt in &pkts {
+                        match socket.send(pkt) {
                             Ok(n) => sent += n,
-                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                            // 非阻塞模式下满缓冲会返回 WouldBlock，丢包比卡循环强。
+                            Err(e)
+                                if e.kind() == std::io::ErrorKind::WouldBlock
+                                    || e.kind() == std::io::ErrorKind::TimedOut =>
+                            {
+                                break
+                            }
                             Err(e) => return Err(e).context("发送视频包失败"),
                         }
                     }
                     stat_bytes += sent as u64;
                     stat_frames += 1;
+
+                    // 缓存最近几帧，给 NACK 用。
+                    resend_cache.push_back((f.id, pkts));
+                    while resend_cache.len() > 8 {
+                        resend_cache.pop_front();
+                    }
+
                     // 编码器从收到输入到吐出这一帧的气泡，直接反映链路里最大的延迟源。
                     let age = now_us() - f.pts_us as i64;
                     if age > 0 {
@@ -318,9 +363,50 @@ fn play(args: &[String]) -> Result<()> {
             }
             Acquire::Timeout => {}
             Acquire::AccessLost => {
-                tracing::warn!("复制链路断开，尝试重建");
-                // 简化处理：W1a 直接退出，让外壳重启。重建逻辑留给 W2。
-                bail!("桌面复制断开（切分辨率 / 全屏独占 / 锁屏）");
+                tracing::warn!("桌面复制断开（切分辨率 / 全屏独占 / 锁屏 / UAC），重建中");
+                // 设备、复制器、转换器、编码器整套重建：设备一变，
+                // 挂在旧设备上的 D3D 设备管理器就作废了。
+                let rebuilt = (|| -> Result<(capture::Duplicator, encode::Encoder, Option<video_proc::Nv12Converter>)> {
+                    let outputs = d3d::enum_outputs()?;
+                    let info = outputs
+                        .get(output_index)
+                        .with_context(|| format!("没有第 {output_index} 个输出"))?;
+                    let (device, context) = d3d::create_device(&info.adapter)?;
+                    let new_dupl = capture::Duplicator::new(device, context, info)?;
+                    let new_cfg = EncodeConfig {
+                        codec: Codec::H264,
+                        width: new_dupl.width(),
+                        height: new_dupl.height(),
+                        fps,
+                        bitrate_bps: bitrate,
+                        keyframe_interval: 0,
+                    };
+                    let new_encoder =
+                        encode::Encoder::new(&new_cfg, encoder_pref, Some(new_dupl.device()))?;
+                    let new_conv = build_converter(&new_dupl, &new_encoder, fps)?;
+                    Ok((new_dupl, new_encoder, new_conv))
+                })();
+
+                match rebuilt {
+                    Ok((d, e, c)) => {
+                        dupl = d;
+                        encoder = e;
+                        converter = c;
+                        // 分辨率可能变了，帧号重开一段，收端不依赖它的连续性。
+                        resend_cache.clear();
+                        next_frame_at = Instant::now();
+                        tracing::info!(
+                            "重建完成，{}x{}",
+                            dupl.width(),
+                            dupl.height()
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!("重建失败，再试一次: {e:#}");
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
+                }
+                continue;
             }
         }
 
@@ -328,13 +414,15 @@ fn play(args: &[String]) -> Result<()> {
             let secs = last_stat.elapsed().as_secs_f64();
             if stat_frames > 0 {
                 tracing::info!(
-                    "采 {} 帧 → 编 {} 帧  {:.1} Mbps  采集+转码 {:.2}ms  编码 {:.2}ms  编码器滞后 {:.1}ms",
+                    "采 {} 帧 → 编 {} 帧  {:.1} Mbps  采集+转码 {:.2}ms  编码 {:.2}ms  编码器滞后 {:.1}ms  NACK {} 补发 {}",
                     stat_captured,
                     stat_frames,
                     stat_bytes as f64 * 8.0 / secs / 1e6,
                     stat_capture_us as f64 / 1000.0 / stat_frames.max(1) as f64,
                     stat_encode_us as f64 / 1000.0 / stat_frames.max(1) as f64,
                     stat_encoder_lag_us as f64 / 1000.0 / stat_frames.max(1) as f64,
+                    stat_nacks,
+                    stat_resends,
                 );
             } else {
                 tracing::info!("屏幕无变化");
@@ -345,6 +433,8 @@ fn play(args: &[String]) -> Result<()> {
             stat_capture_us = 0;
             stat_encode_us = 0;
             stat_encoder_lag_us = 0;
+            stat_nacks = 0;
+            stat_resends = 0;
             last_stat = Instant::now();
         }
     }
@@ -358,6 +448,25 @@ fn play(args: &[String]) -> Result<()> {
     }
     tracing::info!("退出");
     Ok(())
+}
+
+/// 硬件编码器要显存里的 NV12 纹理，软件编码器吃系统内存，所以转换器是可选的。
+fn build_converter(
+    dupl: &capture::Duplicator,
+    encoder: &encode::Encoder,
+    fps: u32,
+) -> Result<Option<video_proc::Nv12Converter>> {
+    if !encoder.wants_texture() {
+        return Ok(None);
+    }
+    Ok(Some(video_proc::Nv12Converter::new(
+        dupl.device(),
+        dupl.context(),
+        dupl.target(),
+        dupl.width(),
+        dupl.height(),
+        fps,
+    )?))
 }
 
 fn now_us() -> i64 {

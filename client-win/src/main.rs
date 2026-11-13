@@ -23,7 +23,7 @@ use anyhow::{Context, Result};
 use app::App;
 use decode::Decoder;
 use omrc_core::proto::ControlMessage;
-use omrc_transport_lan::{Header, Reassembler};
+use omrc_transport_lan::{Header, LossAction, LossTracker, Reassembler, fragment_control};
 use windows::Win32::Media::MediaFoundation::{MFStartup, MFShutdown, MFSTARTUP_FULL, MF_VERSION};
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
 
@@ -100,13 +100,19 @@ fn main() -> Result<()> {
 
     let shared = Arc::new(Shared::default());
     let dump_path = std::env::var_os("OMRC_DUMP");
+    let loss = args
+        .iter()
+        .position(|a| a == "--loss")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.0);
 
     {
         let shared = Arc::clone(&shared);
         let socket = socket.try_clone().context("复制 socket 失败")?;
         std::thread::Builder::new()
             .name("recv".into())
-            .spawn(move || recv_loop(socket, shared, dump_path))?;
+            .spawn(move || recv_loop(socket, shared, dump_path, loss))?;
     }
 
     let mut app = App::new();
@@ -198,17 +204,29 @@ fn main() -> Result<()> {
 }
 
 /// 收包线程：只做「收 → 重组 → 入队」，不碰 UI，也不做解码。
-fn recv_loop(socket: UdpSocket, shared: Arc<Shared>, dump_path: Option<std::ffi::OsString>) {
+///
+/// 丢包补救也在这里做：补片请求（NACK）和要关键帧都是控制包，发回去就行。
+fn recv_loop(
+    socket: UdpSocket,
+    shared: Arc<Shared>,
+    dump_path: Option<std::ffi::OsString>,
+    loss: f64,
+) {
     let mut video = Reassembler::new(16);
     let mut control = Reassembler::new(8);
+    let mut tracker = LossTracker::default();
     let mut buf = vec![0u8; 2048];
+    // 第一次收到包之前用它没有意义，所以不初始化。
+    let mut host_addr: std::net::SocketAddr;
+    let mut ctrl_id = 1_000_000u64;
+    let mut rng: u64 = 0x2545_F491_4F6C_DD1D;
     let mut dump = dump_path.map(|p| {
         std::fs::File::create(std::path::PathBuf::from(p)).expect("无法创建 dump 文件")
     });
     use std::io::Write as _;
 
     loop {
-        let (n, _from) = match socket.recv_from(&mut buf) {
+        let (n, from) = match socket.recv_from(&mut buf) {
             Ok(v) => v,
             Err(e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
@@ -222,6 +240,17 @@ fn recv_loop(socket: UdpSocket, shared: Arc<Shared>, dump_path: Option<std::ffi:
                 continue;
             }
         };
+        host_addr = from;
+
+        // 模拟丢包（调试 NACK 用）：按概率直接扔。
+        if loss > 0.0 {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            if (rng % 10_000) as f64 / 10_000.0 < loss {
+                continue;
+            }
+        }
 
         let Some(header) = Header::decode(&buf[..n]) else {
             continue;
@@ -233,7 +262,18 @@ fn recv_loop(socket: UdpSocket, shared: Arc<Shared>, dump_path: Option<std::ffi:
                     push(&shared, Item::Control(msg));
                 }
             }
-        } else if let Some(frame) = video.push(&buf[..n]) {
+            continue;
+        }
+
+        tracker.observe(header.frame_id);
+        if tracker.is_abandoned(header.frame_id) {
+            continue;
+        }
+        if let Some(frame) = video.push(&buf[..n]) {
+            tracker.observe_completed(frame.frame_id);
+            if frame.keyframe {
+                tracker.on_keyframe();
+            }
             if let Some(f) = dump.as_mut() {
                 let _ = f.write_all(&(frame.data.len() as u32).to_le_bytes());
                 let _ = f.write_all(&frame.data);
@@ -245,6 +285,30 @@ fn recv_loop(socket: UdpSocket, shared: Arc<Shared>, dump_path: Option<std::ffi:
                     pts_us: frame.pts_us,
                 }),
             );
+        }
+
+        // 检查有没有补不回来的帧，该发 NACK 发 NACK，该要 IDR 要 IDR。
+        for action in tracker.poll(&mut video) {
+            let msg = match action {
+                LossAction::Nack { frame_id, slices } => {
+                    tracing::debug!(frame_id, count = slices.len(), "请求重传");
+                    ControlMessage::Nack { frame_id, slices }
+                }
+                LossAction::Drop { frame_id } => {
+                    tracing::debug!(frame_id, "放弃一帧");
+                    continue;
+                }
+                LossAction::RequestKeyframe => {
+                    tracing::info!("丢包救不回来，向主机要关键帧");
+                    ControlMessage::RequestKeyframe
+                }
+            };
+            if let Some(addr) = Some(host_addr) {
+                for pkt in fragment_control(&msg, ctrl_id, 0) {
+                    let _ = socket.send_to(&pkt, addr);
+                }
+                ctrl_id += 1;
+            }
         }
     }
 }

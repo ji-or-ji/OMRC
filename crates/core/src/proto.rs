@@ -86,7 +86,12 @@ pub enum ControlMessage {
     CursorShape(CursorShape),
     /// 光标位置。每帧一条。
     CursorPos(CursorPos),
-    /// 收端请求立刻出一个 IDR。
+    /// 收端缺片，请求重发这些分片。
+    ///
+    /// 内网丢包极少，但一旦丢了某一片，不补就得等下一个 IDR；
+    /// 局域网往返 1ms，补一片比等关键帧划算得多。
+    Nack { frame_id: u64, slices: Vec<u16> },
+    /// 收端请求立刻出一个 IDR。重传放弃后才用。
     RequestKeyframe,
     /// 回执，用于测 RTT。
     Ping { nonce: u64, sent_us: u64 },
@@ -116,6 +121,10 @@ mod tests {
                 visible: true,
             }),
             ControlMessage::RequestKeyframe,
+            ControlMessage::Nack {
+                frame_id: 4242,
+                slices: vec![1, 5, 9],
+            },
             ControlMessage::CursorShape(CursorShape {
                 format: CursorFormat::Bgra,
                 width: 32,
