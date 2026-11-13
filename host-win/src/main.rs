@@ -2,7 +2,7 @@
 //!
 //! 现阶段只做启动自检。W1 的第一件事是接上 DXGI 桌面复制。
 
-use connecter_core::PROTOCOL_VERSION;
+use omrc_core::PROTOCOL_VERSION;
 
 fn main() {
     tracing_subscriber::fmt()
@@ -17,13 +17,13 @@ fn main() {
         protocol = PROTOCOL_VERSION,
         os = std::env::consts::OS,
         arch = std::env::consts::ARCH,
-        "connecter host 启动"
+        "omrc host 启动"
     );
 
     tracing::info!("MTU={} 包头={} 载荷上限={}",
-        connecter_transport_lan::MTU,
-        connecter_transport_lan::HEADER_LEN,
-        connecter_transport_lan::MAX_PAYLOAD,
+        omrc_transport_lan::MTU,
+        omrc_transport_lan::HEADER_LEN,
+        omrc_transport_lan::MAX_PAYLOAD,
     );
 
     tracing::warn!("W1 目标：DXGI 抓屏 → Media Foundation 硬编 → UDP 发送");

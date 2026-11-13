@@ -27,7 +27,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use connecter_core::transport::EncodedFrame;
+use omrc_core::transport::EncodedFrame;
 
 /// 单片最大长度，含包头。取 1200 是为了在常见 MTU 1500 下留足余量，
 /// 同时避开部分链路上的 PMTU 黑洞。

@@ -1,5 +1,5 @@
 [package]
-name = "connecter-transport-lan"
+name = "omrc-transport-lan"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,4 +7,4 @@ license.workspace = true
 description = "内网传输后端：裸 UDP、无拥塞控制、无 pacing、Noise 加密。"
 
 [dependencies]
-connecter-core.workspace = true
+omrc-core.workspace = true

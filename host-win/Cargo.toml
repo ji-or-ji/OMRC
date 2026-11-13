@@ -1,5 +1,5 @@
 [package]
-name = "connecter-host"
+name = "omrc-host"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,12 +7,12 @@ license.workspace = true
 description = "Windows 主机端：抓屏、编码、输入注入、虚拟显示器、终端。"
 
 [[bin]]
-name = "connecter-host"
+name = "omrc-host"
 path = "src/main.rs"
 
 [dependencies]
-connecter-core.workspace = true
-connecter-transport-lan.workspace = true
+omrc-core.workspace = true
+omrc-transport-lan.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

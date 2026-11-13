@@ -1,4 +1,4 @@
-//! Connecter 核心。
+//! OMRC 核心。
 //!
 //! 这个 crate 里**不允许**出现任何平台相关的东西：没有 windows、没有 jni、
 //! 没有 ndk、没有文件系统路径假设。它是纯逻辑，能在桌面机上用 `cargo test`

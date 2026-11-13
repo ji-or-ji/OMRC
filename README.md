@@ -1,6 +1,8 @@
-# Connecter
+# OMRC
 
-局域网 / 公网 双模式的远程桌面。安卓控 Win，Win 控 Win。
+**Oppose member remote control**
+
+局域网 / 公网双模式的远程桌面。安卓控 Win，Win 控 Win。
 
 ## 状态
 
@@ -14,6 +16,7 @@
 | `docs/01-视觉方案与UI层选型.md` | 陀螺仪伪 3D 的技术拆解、UI 框架对比 |
 | `docs/02-分层与构建.md` | 代码边界、三端结构、构建链路、验证清单 |
 | `docs/03-选型定稿.md` | **当前唯一有效的施工图** |
+| `docs/04-环境清单.md` | 依赖状态与安装步骤 |
 
 ## 结构
 
@@ -39,4 +42,6 @@ Rust 不认识 Surface、窗口、显卡纹理，只负责把画面变成有序�
 
 ## 许可
 
-MIT OR Apache-2.0
+[PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0)
+
+允许个人学习、研究、试验、业余项目与非商业组织使用，不允许商业用途。
