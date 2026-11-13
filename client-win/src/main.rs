@@ -117,6 +117,7 @@ fn main() -> Result<()> {
     let mut decode_n = 0u64;
     let mut shown = 0u64;
     let mut drained = 0u64;
+    let mut controls = 0u64;
     let mut last_report = Instant::now();
     let mut busy_us = 0u128;
     let mut wall_start = Instant::now();
@@ -131,7 +132,10 @@ fn main() -> Result<()> {
         let mut newest: Option<(Vec<u8>, u64, u64)> = None;
         for item in items {
             match item {
-                Item::Control(msg) => app.on_control(msg),
+                Item::Control(msg) => {
+                    controls += 1;
+                    app.on_control(msg)
+                }
                 Item::Frame(frame) => {
                     drained += 1;
                     let wire = frame.data.len() as u64;
@@ -160,7 +164,7 @@ fn main() -> Result<()> {
             let wall = wall_start.elapsed().as_micros();
             let (_i, outs, rej) = decoder.stats();
             tracing::info!(
-                "收 {} 帧 / 解 {} 帧（{:.1} ms/帧）/ 显示 {} / 拒收 {} / 已解 {} / 占用 {:.0}%",
+                "收 {} 帧 / 解 {} 帧（{:.1} ms/帧）/ 显示 {} / 控制 {} / 拒收 {} / 占用 {:.0}%",
                 drained,
                 decode_n,
                 if decode_n > 0 {
@@ -169,10 +173,12 @@ fn main() -> Result<()> {
                     0.0
                 },
                 shown,
+                controls,
                 rej,
-                outs,
                 busy_us as f64 * 100.0 / wall.max(1) as f64
             );
+            let _ = outs;
+            controls = 0;
             decode_us = 0;
             decode_n = 0;
             shown = 0;
