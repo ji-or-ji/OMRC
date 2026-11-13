@@ -50,3 +50,14 @@ export/
 # 日志
 *.log
 logs/
+
+# 提权托管的工作目录（只在本机用，不进仓库）
+/.admin/inbox/
+/.admin/outbox/
+/.admin/host.log
+/.admin/stop
+
+# ��ʱץͼ������
+/shot.png
+/stream.bin
+

@@ -14,14 +14,15 @@
 
 ---
 
-## 二、当前状态（2026-11-13 晚）
+## 二、当前状态（2026-11-13 深夜）
 
 | 项 | 状态 |
 |---|---|
-| 仓库 | 已建，双远端，最新 commit `a649640` |
-| 代码 | 可编译、可测试、可运行，是骨架不是空壳 |
+| 仓库 | 已建，双远端 |
+| W1a | **已打通**：抓屏 → 硬件编码 → UDP → 重组 → 解码 → 上屏，1920×1080、37~41 fps、端到端 37ms |
+| 代码 | 可编译、可测试、可运行 |
 | 环境 | Rust + VS Build Tools + Windows SDK 就绪 |
-| Android SDK / NDK | **未装**，W1 的安卓部分需要 |
+| Android SDK / NDK | **未装**，W1b 需要 |
 | Godot | **未装**，W2 才需要 |
 
 远端：
@@ -35,9 +36,15 @@
 
 ```powershell
 $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
-cargo check --workspace --all-targets
-cargo test --workspace      # 10 个用例
-cargo run -p omrc-host
+cargo test --workspace          # 19 个用例
+cargo build --release --workspace
+```
+
+跑 W1a 闭环（两个终端，详见 `docs/05-W1a-闭环.md`）：
+
+```powershell
+target\release\omrc-client.exe --listen 0.0.0.0:9100
+target\release\omrc-host.exe play --peer 127.0.0.1:9100 --seconds 6 --fps 60 --encoder hw
 ```
 
 ---
@@ -79,50 +86,37 @@ Rust 不认识 Surface、窗口、纹理。这条纪律保证双端能在同一�
 
 ```
 crates/core/              纯 Rust，零平台依赖
-  proto.rs                握手魔数与能力位
+  proto.rs                控制消息（光标形状/位置、关键帧请求、心跳），postcard 序列化
   transport.rs            Transport trait、EncodedFrame、Message
   input.rs                统一输入事件（归一化坐标）
   video.rs                Codec / QualityProfile / EncodeConfig
   session.rs              状态机，含 Migrating 态（网络迁移用）
-crates/transport-lan/     已实现分片与重组，10 个用例通过
-host-win/                 目前只打印启动信息
+  pixel.rs                BGRA ↔ NV12 换算（两端共用，带行距版本）
+crates/transport-lan/     分片与重组，14 个用例；控制包走同一套分片、按 CONTROL 位分流
+host-win/                 主机端
+  d3d.rs                  适配器/输出枚举、D3D11 设备
+  capture.rs              DXGI 桌面复制、光标形状提取
+  overlay.rs              时间码叠字（GDI 小 DIB → UpdateSubresource）
+  video_proc.rs           D3D11 Video Processor：BGRA → NV12（显存内）
+  encode.rs               MF 硬件/软件 H.264，异步 MFT 支持
+  mft.rs                  MFT 诊断（omrc-host mft）
+client-win/               W1a 回环接收端（不是最终 Windows 客户端）
+  decode.rs               MF 软解 + 宏块对齐裁剪
+  app.rs                  GDI 窗口、光标合成
+  main.rs                 收包线程 + UI 线程、离线回放
 client-android/           只有 README
-client-windows/           只有 README
-docs/                     设计与调研
+client-windows/           只有 README（最终客户端 W2 再写）
 ```
 
-`transport-lan` 已实现：
-
-- `fragment(&EncodedFrame) -> Vec<Vec<u8>>`，32 字节包头 + 最大 1168 字节载荷
-- `Reassembler`，容忍乱序与重复，缺片不吐半帧，能报 `missing()` 供 NACK
-- 在途帧数上限，超限丢最旧
+关键实现细节见 `docs/05-W1a-闭环.md` 第四节（六个坑，全是会再踩的）。
 
 ---
 
-## 五、下一步：W1
+## 五、下一步：W1b（换成安卓）
 
-目标：**打通「抓屏 → 编码 → UDP → 解码上屏」的最小链路。**
-不做输入、不做 UI、不做虚拟屏、不做动效。
+W1a 的验收已经过了（硬件路径 37ms < 80ms）。接下来两条路，按 `docs/03` 的顺序走：
 
-### 建议拆成两段
-
-**W1a：纯 Windows 闭环（不需要安卓）**
-
-先做主机端和一个本地回环接收端，两边都在 Rust 里，用 `127.0.0.1` 通信。这样整条链路能在桌面上调试，不依赖手机。
-
-1. 初始化 D3D11 设备，枚举输出（`IDXGIFactory1` → `EnumAdapters1` → `EnumOutputs`）
-2. `IDXGIOutputDuplication::DuplicateOutput` 建立桌面复制
-3. 循环 `AcquireNextFrame` 拿 `ID3D11Texture2D`，处理 `DXGI_ERROR_ACCESS_LOST` 与 `WAIT_TIMEOUT`
-4. 光标分离：`GetFramePointerShape` + `PointerPosition`，作为独立小消息发送（这一步对主观延迟影响极大，别省）
-5. 编码：`MFTEnumEx` 找硬件 H.264 编码器，`CODECAPI_AVLowLatencyMode`，`MFT_MESSAGE_SET_D3D_MANAGER` 走零拷贝
-6. 输出 NAL → `fragment()` → UDP 发送
-7. 回环接收端：`Reassembler` → 解码 → 显示（可先用简单窗口）
-
-验收：1080p60，端到端延迟 < 80ms，连跑一小时不崩。
-
-测延迟的土办法最准：主机在画面角落渲染每帧变化的毫秒时间码，用另一台高帧率相机拍屏对比。
-
-**W1b：换成安卓**
+**W1b：安卓端**
 
 1. 装 Android SDK + NDK（见 `docs/04-环境清单.md`）
 2. `rustup target add aarch64-linux-android x86_64-linux-android`
@@ -130,9 +124,16 @@ docs/                     设计与调研
 4. 最小 Android 工程：Activity + SurfaceView + MediaCodec 异步模式
 5. `cargo ndk` 编出 `.so`，JNI 桥接
 
-### Rust 依赖预告
+**W1a 还剩的收尾（可选，不急）**
 
-W1 会用到 `windows`（DXGI / Media Foundation）、`tokio`（UDP 收发）、`snow`（Noise，如果要先上加密）。目前都还没加。
+- NACK 与关键帧请求：`Reassembler::missing()` 和 `Encoder::request_keyframe()` 都已就位，缺一条回传链路
+- 复制链路断开（切分辨率 / 全屏独占 / 锁屏）后自动重建，现在直接退出
+- 多显示器、负坐标
+
+### Rust 依赖现状
+
+已加：`windows`（DXGI / D3D11 / MF）、`anyhow`、`serde` + `postcard`、`tracing`。
+未加：`tokio`（W1a 用 std 线程够）、`snow`（Noise 加密，等控制通道定下来再上）。
 
 ---
 
@@ -170,6 +171,7 @@ $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
 
 | 文件 | 状态 |
 |---|---|
+| `docs/05-W1a-闭环.md` | **本轮记录**：实测数据、链路结构、六个坑 |
 | `docs/03-选型定稿.md` | **当前施工图，权威** |
 | `docs/04-环境清单.md` | 环境状态与安装步骤 |
 | `docs/02-分层与构建.md` | 代码边界与三端结构，有效 |
@@ -180,5 +182,6 @@ $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
 
 ## 九、给新会话的开场白
 
-> 读 `HANDOFF.md` 和 `docs/03-选型定稿.md`，然后从第五节 W1a 开始做。
+> 读 `HANDOFF.md` 和 `docs/05-W1a-闭环.md`，W1a 已经跑通。
+> 下一步是 W1b（安卓端），先装 Android SDK / NDK。
 > 七条根决定不要重新讨论，有疑问先问再改。

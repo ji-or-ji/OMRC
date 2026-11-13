@@ -4,6 +4,7 @@ members = [
     "crates/core",
     "crates/transport-lan",
     "host-win",
+    "client-win",
 ]
 
 [workspace.package]
@@ -16,9 +17,31 @@ license = "PolyForm-Noncommercial-1.0.0"
 omrc-core = { path = "crates/core" }
 omrc-transport-lan = { path = "crates/transport-lan" }
 
+anyhow = "1"
+postcard = { version = "1", features = ["alloc"] }
+serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
+
+# Windows 平台 API。feature 在 workspace 里统一开，两端共用同一份编译。
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Gdi",
+    "Win32_Media_MediaFoundation",
+    "Win32_Networking_WinSock",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [profile.release]
 opt-level = 3

@@ -1,0 +1,21 @@
+[package]
+name = "omrc-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Windows 客户端（W1a 回环验证用）：收包、重组、硬解、上屏。"
+
+[[bin]]
+name = "omrc-client"
+path = "src/main.rs"
+
+[dependencies]
+omrc-core.workspace = true
+omrc-transport-lan.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows.workspace = true

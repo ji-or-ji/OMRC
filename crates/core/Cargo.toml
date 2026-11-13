@@ -8,3 +8,5 @@ description = "协议、传输抽象、编解码抽象与输入模型。零平�
 
 [dependencies]
 thiserror.workspace = true
+serde.workspace = true
+postcard.workspace = true

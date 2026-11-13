@@ -27,6 +27,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use omrc_core::proto::ControlMessage;
 use omrc_core::transport::EncodedFrame;
 
 /// 单片最大长度，含包头。取 1200 是为了在常见 MTU 1500 下留足余量，
@@ -95,6 +96,11 @@ impl Header {
     pub fn is_last_slice(&self) -> bool {
         self.flags & flags::LAST_SLICE != 0
     }
+
+    /// 控制包要送去控制侧的重组器，不能混进视频帧。
+    pub fn is_control(&self) -> bool {
+        self.flags & flags::CONTROL != 0
+    }
 }
 
 /// 重组完成的一帧。
@@ -115,30 +121,43 @@ pub fn slice_count(len: usize) -> usize {
 ///
 /// 返回的每片都是可以直接塞进 socket 的完整字节。
 pub fn fragment(frame: &EncodedFrame) -> Vec<Vec<u8>> {
-    if frame.data.is_empty() {
+    let mut extra = 0u32;
+    if frame.keyframe {
+        extra |= flags::KEYFRAME;
+    }
+    fragment_with(frame.id, frame.pts_us, &frame.data, extra)
+}
+
+/// 把一条控制消息切成若干分片。
+///
+/// 控制消息和视频帧共用同一套分片与重组代码，只靠包头里的 `CONTROL` 位区分。
+/// 这样光标位图（最大几十 KB）也不用为它单开一条通道。
+pub fn fragment_control(msg: &ControlMessage, id: u64, pts_us: u64) -> Vec<Vec<u8>> {
+    fragment_with(id, pts_us, &msg.encode(), flags::CONTROL)
+}
+
+fn fragment_with(frame_id: u64, pts_us: u64, data: &[u8], extra_flags: u32) -> Vec<Vec<u8>> {
+    if data.is_empty() {
         return Vec::new();
     }
 
-    let total = slice_count(frame.data.len());
-    debug_assert!(total <= u16::MAX as usize, "单帧过大，分片数超出 u16");
+    let total = slice_count(data.len());
+    assert!(total <= u16::MAX as usize, "单帧过大，分片数超出 u16");
 
     let mut out = Vec::with_capacity(total);
-    for (i, chunk) in frame.data.chunks(MAX_PAYLOAD).enumerate() {
-        let mut f = 0u32;
-        if frame.keyframe {
-            f |= flags::KEYFRAME;
-        }
+    for (i, chunk) in data.chunks(MAX_PAYLOAD).enumerate() {
+        let mut f = extra_flags;
         if i + 1 == total {
             f |= flags::LAST_SLICE;
         }
 
         let h = Header {
-            frame_id: frame.id,
+            frame_id,
             seq: i as u32,
             slice_id: i as u16,
             slice_count: total as u16,
             flags: f,
-            pts_us: frame.pts_us,
+            pts_us,
         };
 
         let mut pkt = Vec::with_capacity(HEADER_LEN + chunk.len());
@@ -186,10 +205,21 @@ impl Reassembler {
         }
     }
 
-    /// 喂一个原始包（含包头）。凑齐一帧就返回它。
+    /// 喂一个视频包（含包头）。凑齐一帧就返回它。
+    ///
+    /// 控制包会被忽略，控制包请交给另一个重组器用 [`Reassembler::push_control`]。
     pub fn push(&mut self, pkt: &[u8]) -> Option<CompletedFrame> {
+        self.push_inner(pkt, false)
+    }
+
+    /// 喂一个控制包。与视频重组器用同一套逻辑，只是取消了对 `CONTROL` 位的过滤。
+    pub fn push_control(&mut self, pkt: &[u8]) -> Option<CompletedFrame> {
+        self.push_inner(pkt, true)
+    }
+
+    fn push_inner(&mut self, pkt: &[u8], allow_control: bool) -> Option<CompletedFrame> {
         let h = Header::decode(pkt)?;
-        if h.flags & flags::CONTROL != 0 {
+        if h.is_control() != allow_control {
             return None;
         }
         if h.slice_count == 0 || h.slice_id >= h.slice_count {
@@ -299,6 +329,7 @@ impl Reassembler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use omrc_core::proto::{CursorPos, CursorShape};
 
     fn frame(id: u64, len: usize, keyframe: bool) -> EncodedFrame {
         EncodedFrame {
@@ -438,5 +469,44 @@ mod tests {
             done = r.push(p).or(done);
         }
         assert_eq!(done.expect("新帧应能重组").frame_id, 2);
+    }
+
+    #[test]
+    fn 控制包跨分片重组且不进视频重组器() {
+        let msg = ControlMessage::CursorShape(CursorShape {
+            format: omrc_core::proto::CursorFormat::Bgra,
+            width: 64,
+            height: 64,
+            hot_x: 0,
+            hot_y: 0,
+            pixels: (0..64 * 64 * 4).map(|i| i as u8).collect(),
+        });
+        let pkts = fragment_control(&msg, 9001, 123);
+        assert!(pkts.len() > 1, "光标位图应该需要多个分片");
+
+        let mut video = Reassembler::default();
+        let mut control = Reassembler::default();
+        let mut got = None;
+        for p in pkts.iter().rev() {
+            assert!(video.push(p).is_none(), "视频重组器不该吃控制包");
+            if let Some(x) = control.push_control(p) {
+                got = Some(x);
+            }
+        }
+
+        let done = got.expect("控制包应能重组");
+        assert_eq!(done.frame_id, 9001);
+        assert_eq!(ControlMessage::decode(&done.data), Some(msg));
+        assert_eq!(video.inflight(), 0);
+    }
+
+    #[test]
+    fn 视频包不会被控制重组器吃掉() {
+        let f = frame(3, MAX_PAYLOAD * 2, true);
+        let mut control = Reassembler::default();
+        for p in fragment(&f) {
+            assert!(control.push_control(&p).is_none());
+        }
+        assert_eq!(control.inflight(), 0);
     }
 }

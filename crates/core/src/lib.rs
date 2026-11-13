@@ -7,6 +7,7 @@
 //! 这条纪律是整个架构的地基。一旦有平台依赖渗进来，双端同进程测试就崩了。
 
 pub mod input;
+pub mod pixel;
 pub mod proto;
 pub mod session;
 pub mod transport;
