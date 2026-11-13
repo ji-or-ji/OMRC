@@ -9,16 +9,17 @@ use anyhow::Result;
 use omrc_core::proto::{ControlMessage, CursorPos, CursorShape};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateSolidBrush, DIB_RGB_COLORS, EndPaint,
-    FillRect, InvalidateRect, PAINTSTRUCT, SRCCOPY, StretchDIBits,
+    BeginPaint, BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleDC,
+    CreateDIBSection, CreateSolidBrush, DIB_RGB_COLORS, DeleteDC, DeleteObject, EndPaint, FillRect,
+    HDC, HBITMAP, HGDIOBJ, InvalidateRect, PAINTSTRUCT, SRCCOPY, SelectObject, StretchDIBits,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
     GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, IsWindowVisible, MSG,
     PM_REMOVE, PeekMessageW, PostQuitMessage, RegisterClassW, SW_SHOW, SetWindowLongPtrW,
-    SetWindowTextW, ShowWindow, TranslateMessage, WM_DESTROY, WM_PAINT, WM_SIZE, WNDCLASSW,
-    WS_OVERLAPPEDWINDOW,
+    SetWindowTextW, ShowWindow, TranslateMessage, WM_DESTROY, WM_ERASEBKGND, WM_PAINT, WM_SIZE,
+    WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::w;
 
@@ -41,6 +42,15 @@ pub struct App {
     paint_n: u64,
     last_stat: Instant,
     last_pts_us: i64,
+    /// 双缓冲：先画到内存 DC，再一次性贴上去。
+    ///
+    /// 不加这层的话，每帧“黑底 → 拉伸上屏”中间会赫一帧黑，
+    /// 快速运动时就是一直闪黑。
+    back_dc: HDC,
+    back_bitmap: HBITMAP,
+    back_old: HGDIOBJ,
+    back_w: i32,
+    back_h: i32,
 }
 
 impl App {
@@ -65,10 +75,15 @@ impl App {
             paint_n: 0,
             last_stat: Instant::now(),
             last_pts_us: 0,
+            back_dc: HDC::default(),
+            back_bitmap: HBITMAP::default(),
+            back_old: HGDIOBJ::default(),
+            back_w: 0,
+            back_h: 0,
         }
     }
 
-    pub fn create_window(&mut self, title: &str) -> Result<()> {
+    pub fn create_window(&mut self, title: &str, width: i32, height: i32) -> Result<()> {
         unsafe {
             let instance = GetModuleHandleW(None)?;
             let class_name = w!("omrc_client_window");
@@ -92,8 +107,8 @@ impl App {
                 WS_OVERLAPPEDWINDOW,
                 100,
                 100,
-                1280,
-                720,
+                width,
+                height,
                 None,
                 None,
                 Some(instance.into()),
@@ -215,6 +230,41 @@ impl App {
         self.last_stat = Instant::now();
     }
 
+    /// 确保内存 DC 跟客户区一样大。尺寸变了（拉伸窗口）就重建。
+    fn ensure_backbuffer(&mut self, w: i32, h: i32) {
+        if self.back_dc.is_invalid() || self.back_w != w || self.back_h != h {
+            unsafe {
+                if !self.back_dc.is_invalid() {
+                    SelectObject(self.back_dc, self.back_old);
+                    let _ = DeleteObject(self.back_bitmap.into());
+                    let _ = DeleteDC(self.back_dc);
+                }
+                self.back_dc = CreateCompatibleDC(None);
+                let info = BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER {
+                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth: w,
+                        biHeight: -h,
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        biCompression: BI_RGB.0,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+                if let Ok(bitmap) =
+                    CreateDIBSection(Some(self.back_dc), &info, DIB_RGB_COLORS, &mut bits, None, 0)
+                {
+                    self.back_bitmap = bitmap;
+                    self.back_old = SelectObject(self.back_dc, bitmap.into());
+                    self.back_w = w;
+                    self.back_h = h;
+                }
+            }
+        }
+    }
+
     fn paint(&mut self) {
         let t0 = Instant::now();
         unsafe {
@@ -223,60 +273,65 @@ impl App {
             let mut rect = RECT::default();
             let _ = GetClientRect(self.hwnd, &mut rect);
 
-            if !self.has_frame || self.video.is_empty() {
-                let brush = CreateSolidBrush(COLORREF(0));
-                let _ = FillRect(hdc, &rect, brush);
-                let _ = windows::Win32::Graphics::Gdi::DeleteObject(brush.into());
-                let _ = EndPaint(self.hwnd, &ps);
-                return;
-            }
-
-            // 等比铺满，不拉伸变形。
             let w = (rect.right - rect.left).max(1);
             let h = (rect.bottom - rect.top).max(1);
-            let src_ratio = self.width as f32 / self.height as f32;
-            let dst_ratio = w as f32 / h as f32;
-            let (dw, dh) = if dst_ratio > src_ratio {
-                ((h as f32 * src_ratio) as i32, h)
+            self.ensure_backbuffer(w, h);
+            let target = if self.back_w == w && self.back_h == h {
+                self.back_dc
             } else {
-                (w, (w as f32 / src_ratio) as i32)
+                hdc
             };
-            let dx = (w - dw) / 2;
-            let dy = (h - dh) / 2;
 
-            // 黑边。
+            // 先整块刷黑（黑边），再等比把画面贴进去，最后一次性 BitBlt，
+            // 中间过程用户看不见，不会闪。
             let brush = CreateSolidBrush(COLORREF(0));
-            let _ = FillRect(hdc, &rect, brush);
-            let _ = windows::Win32::Graphics::Gdi::DeleteObject(brush.into());
+            let _ = FillRect(target, &rect, brush);
+            let _ = DeleteObject(brush.into());
 
-            let info = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                    biWidth: self.width as i32,
-                    biHeight: -(self.height as i32),
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    biCompression: BI_RGB.0,
+            if self.has_frame && !self.video.is_empty() && self.width > 0 && self.height > 0 {
+                let src_ratio = self.width as f32 / self.height as f32;
+                let dst_ratio = w as f32 / h as f32;
+                let (dw, dh) = if dst_ratio > src_ratio {
+                    ((h as f32 * src_ratio) as i32, h)
+                } else {
+                    (w, (w as f32 / src_ratio) as i32)
+                };
+                let dx = (w - dw) / 2;
+                let dy = (h - dh) / 2;
+
+                let info = BITMAPINFO {
+                    bmiHeader: BITMAPINFOHEADER {
+                        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                        biWidth: self.width as i32,
+                        biHeight: -(self.height as i32),
+                        biPlanes: 1,
+                        biBitCount: 32,
+                        biCompression: BI_RGB.0,
+                        ..Default::default()
+                    },
                     ..Default::default()
-                },
-                ..Default::default()
-            };
+                };
 
-            let _ = StretchDIBits(
-                hdc,
-                dx,
-                dy,
-                dw,
-                dh,
-                0,
-                0,
-                self.width as i32,
-                self.height as i32,
-                Some(self.video.as_ptr() as *const _),
-                &info,
-                DIB_RGB_COLORS,
-                SRCCOPY,
-            );
+                let _ = StretchDIBits(
+                    target,
+                    dx,
+                    dy,
+                    dw,
+                    dh,
+                    0,
+                    0,
+                    self.width as i32,
+                    self.height as i32,
+                    Some(self.video.as_ptr() as *const _),
+                    &info,
+                    DIB_RGB_COLORS,
+                    SRCCOPY,
+                );
+            }
+
+            if target != hdc {
+                let _ = BitBlt(hdc, 0, 0, w, h, Some(target), 0, 0, SRCCOPY);
+            }
             let _ = EndPaint(self.hwnd, &ps);
         }
         self.paint_us += t0.elapsed().as_micros() as u64;
@@ -336,6 +391,18 @@ fn composite_cursor(
     }
 }
 
+impl Drop for App {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.back_dc.is_invalid() {
+                SelectObject(self.back_dc, self.back_old);
+                let _ = DeleteObject(self.back_bitmap.into());
+                let _ = DeleteDC(self.back_dc);
+            }
+        }
+    }
+}
+
 pub fn now_us() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -363,6 +430,10 @@ unsafe extern "system" fn wndproc(
                 let _ = unsafe { IsWindowVisible(hwnd) };
             }
             return LRESULT(0);
+        }
+        WM_ERASEBKGND => {
+            // 背景由 paint 自己负责（双缓冲），让系统再刷一遍会闪。
+            return LRESULT(1);
         }
         WM_DESTROY => {
             unsafe { PostQuitMessage(0) };

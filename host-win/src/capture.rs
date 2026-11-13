@@ -29,6 +29,26 @@ use windows::core::Interface;
 
 use crate::d3d::OutputInfo;
 
+use windows::Win32::System::StationsAndDesktops::{
+    CloseDesktop, DESKTOP_CONTROL_FLAGS, DESKTOP_READOBJECTS, OpenInputDesktop,
+};
+
+/// 桌面被锁屏 / 进了安全桌面（UAC、Ctrl+Alt+Del）时，`AcquireNextFrame` 会卡死不回。
+///
+/// 这是 DXGI 的老毛病：超时参数在这种情况下不起作用，调用直接挂在内核里。
+/// 所以每次抓帧前先探一下，锁屏期间干脆不调。
+pub fn desktop_locked() -> bool {
+    unsafe {
+        match OpenInputDesktop(DESKTOP_CONTROL_FLAGS(0), false, DESKTOP_READOBJECTS) {
+            Ok(desk) => {
+                let _ = CloseDesktop(desk);
+                false
+            }
+            Err(_) => true,
+        }
+    }
+}
+
 /// 光标这一帧的状态。
 #[derive(Debug, Clone)]
 pub struct PointerUpdate {
@@ -133,6 +153,7 @@ impl Duplicator {
         let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
         let mut resource: Option<IDXGIResource> = None;
 
+        crate::STAGE.store(11, std::sync::atomic::Ordering::Relaxed);
         let acquired = unsafe { self.dupl.AcquireNextFrame(timeout_ms, &mut info, &mut resource) };
         if let Err(e) = acquired {
             if e.code() == DXGI_ERROR_WAIT_TIMEOUT {
@@ -145,7 +166,9 @@ impl Duplicator {
         }
 
         // 拿到就必须还，中间出错也要还。
+        crate::STAGE.store(12, std::sync::atomic::Ordering::Relaxed);
         let result = self.capture_frame(&info, resource);
+        crate::STAGE.store(14, std::sync::atomic::Ordering::Relaxed);
         let _ = unsafe { self.dupl.ReleaseFrame() };
         result
     }
@@ -168,6 +191,7 @@ impl Duplicator {
         }
 
         // 整个复制：桌面纹理 → 自己的纹理。
+        crate::STAGE.store(13, std::sync::atomic::Ordering::Relaxed);
         unsafe { self.context.CopyResource(&self.target, &texture) };
 
         let mut pointer = PointerUpdate {

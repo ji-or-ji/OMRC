@@ -31,12 +31,17 @@ pub struct Nv12Converter {
     video_context: ID3D11VideoContext,
     processor: ID3D11VideoProcessor,
     input_view: ID3D11VideoProcessorInputView,
-    output_view: ID3D11VideoProcessorOutputView,
-    /// 转换结果。编码器直接拿这张纹理。
-    pub texture: ID3D11Texture2D,
+    /// 输出纹理与它对应的视图，轮着用。
+    ///
+    /// 只给一张会出事：编码器是异步的，它可能还在读上一帧的纹理，
+    /// 下一帧的 Blt 就把它盖了——画面会抽黑。三个一起转足够拉开距离。
+    outputs: Vec<(ID3D11Texture2D, ID3D11VideoProcessorOutputView)>,
+    next: usize,
     width: u32,
     height: u32,
 }
+
+const TEXTURE_POOL: usize = 3;
 
 impl Nv12Converter {
     pub fn new(
@@ -94,41 +99,48 @@ impl Nv12Converter {
         };
         let input_view = input_view.context("输入视图为空")?;
 
-        let texture = create_nv12_texture(device, width, height)?;
-
         let output_desc = D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC {
             ViewDimension: D3D11_VPOV_DIMENSION_TEXTURE2D,
             Anonymous: D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0 {
                 Texture2D: D3D11_TEX2D_VPOV { MipSlice: 0 },
             },
         };
-        let mut output_view: Option<ID3D11VideoProcessorOutputView> = None;
-        unsafe {
-            video_device
-                .CreateVideoProcessorOutputView(
-                    &texture,
-                    &enumerator,
-                    &output_desc,
-                    Some(&mut output_view),
-                )
-                .context("创建输出视图失败")?
-        };
-        let output_view = output_view.context("输出视图为空")?;
 
-        tracing::info!("视频处理器就绪（BGRA → NV12，显存内）");
+        let mut outputs = Vec::with_capacity(TEXTURE_POOL);
+        for _ in 0..TEXTURE_POOL {
+            let texture = create_nv12_texture(device, width, height)?;
+            let mut view: Option<ID3D11VideoProcessorOutputView> = None;
+            unsafe {
+                video_device
+                    .CreateVideoProcessorOutputView(
+                        &texture,
+                        &enumerator,
+                        &output_desc,
+                        Some(&mut view),
+                    )
+                    .context("创建输出视图失败")?
+            };
+            let view = view.context("输出视图为空")?;
+            outputs.push((texture, view));
+        }
+
+        tracing::info!("视频处理器就绪（BGRA → NV12，显存内，{} 张纹理轮转）", TEXTURE_POOL);
         Ok(Self {
             video_context,
             processor,
             input_view,
-            output_view,
-            texture,
+            outputs,
+            next: 0,
             width,
             height,
         })
     }
 
-    /// 把源纹理转成 NV12，结果在 `self.texture` 里。
-    pub fn convert(&self) -> Result<()> {
+    /// 把源纹理转成 NV12，返回本轮用的那张。
+    pub fn convert(&mut self) -> Result<&ID3D11Texture2D> {
+        let idx = self.next % self.outputs.len();
+        self.next = self.next.wrapping_add(1);
+
         let mut stream = D3D11_VIDEO_PROCESSOR_STREAM {
             Enable: TRUE,
             OutputIndex: 0,
@@ -146,7 +158,7 @@ impl Nv12Converter {
         let result = unsafe {
             self.video_context.VideoProcessorBlt(
                 &self.processor,
-                &self.output_view,
+                &self.outputs[idx].1,
                 0,
                 std::slice::from_ref(&stream),
             )
@@ -156,7 +168,7 @@ impl Nv12Converter {
 
         result.context("视频处理器 Blt 失败")?;
         let _ = (self.width, self.height);
-        Ok(())
+        Ok(&self.outputs[idx].0)
     }
 }
 

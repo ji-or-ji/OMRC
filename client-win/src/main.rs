@@ -116,7 +116,16 @@ fn main() -> Result<()> {
     }
 
     let mut app = App::new();
-    app.create_window("OMRC 客户端")?;
+    let (win_w, win_h) = args
+        .iter()
+        .position(|a| a == "--size")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| {
+            let (w, h) = v.split_once('x')?;
+            Some((w.parse::<i32>().ok()?, h.parse::<i32>().ok()?))
+        })
+        .unwrap_or((1600, 900));
+    app.create_window("OMRC 客户端", win_w, win_h)?;
     let mut decoder = Decoder::new()?;
 
     let mut decode_us = 0u128;

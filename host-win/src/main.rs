@@ -216,6 +216,7 @@ fn play(args: &[String]) -> Result<()> {
     socket.set_nonblocking(true).context("设置非阻塞失败")?;
 
     tracing::info!(%peer, "开始推流");
+    spawn_watchdog();
 
     let mut nv12 = Vec::new();
     let mut frame_id = 0u64;
@@ -236,10 +237,36 @@ fn play(args: &[String]) -> Result<()> {
     let started = Instant::now();
     let frame_budget = Duration::from_micros(1_000_000 / fps.max(1) as u64);
     let mut next_frame_at = Instant::now();
+    let mut paused = false;
 
     loop {
         if seconds > 0 && started.elapsed() >= Duration::from_secs(seconds) {
             break;
+        }
+
+        // 锁屏 / 安全桌面期间 AcquireNextFrame 会挂死，必须提前避开。
+        if capture::desktop_locked() {
+            if !paused {
+                tracing::info!("桌面已锁定，暂停采集");
+                paused = true;
+            }
+            std::thread::sleep(Duration::from_millis(120));
+            continue;
+        }
+        if paused {
+            paused = false;
+            tracing::info!("桌面已解锁，重建采集链路");
+            match rebuild_pipeline(output_index, encoder_pref, fps, bitrate) {
+                Ok((d, e, c)) => {
+                    dupl = d;
+                    encoder = e;
+                    converter = c;
+                    resend_cache.clear();
+                    next_frame_at = Instant::now();
+                }
+                Err(e) => tracing::error!("解锁后重建失败: {e:#}"),
+            }
+            continue;
         }
 
         // 先把收端发来的控制包收干净（NACK、要 IDR）。非阻塞，不影响主循环。
@@ -276,6 +303,8 @@ fn play(args: &[String]) -> Result<()> {
         }
 
         let t0 = Instant::now();
+        BEAT.fetch_add(1, Ordering::Relaxed);
+        STAGE.store(1, Ordering::Relaxed);
         match dupl.acquire(4)? {
             Acquire::Frame(pointer) => {
                 // 帧率上限：桌面复制本身跟着显示器刷新，管不住；这里按预算丢。
@@ -296,14 +325,18 @@ fn play(args: &[String]) -> Result<()> {
                     frame_id
                 );
                 let pixels = overlay.render(&text);
+                STAGE.store(2, Ordering::Relaxed);
                 dupl.blit_overlay(pixels, overlay_width, overlay_height, 8, 8)?;
                 let t1 = Instant::now();
 
-                let frames = if let Some(conv) = &converter {
-                    conv.convert()?;
-                    encoder.encode_texture(&conv.texture, captured_us)?
+                let frames = if let Some(conv) = converter.as_mut() {
+                    STAGE.store(3, Ordering::Relaxed);
+                    let tex = conv.convert()?;
+                    STAGE.store(4, Ordering::Relaxed);
+                    encoder.encode_texture(tex, captured_us)?
                 } else {
                     dupl.read_nv12(&mut nv12)?;
+                    STAGE.store(4, Ordering::Relaxed);
                     encoder.encode(&nv12, captured_us)?
                 };
                 let t3 = Instant::now();
@@ -313,6 +346,7 @@ fn play(args: &[String]) -> Result<()> {
 
                 for f in &frames {
                     let mut sent = 0usize;
+                    STAGE.store(5, Ordering::Relaxed);
                     let pkts = fragment(f);
                     for pkt in &pkts {
                         match socket.send(pkt) {
@@ -366,26 +400,7 @@ fn play(args: &[String]) -> Result<()> {
                 tracing::warn!("桌面复制断开（切分辨率 / 全屏独占 / 锁屏 / UAC），重建中");
                 // 设备、复制器、转换器、编码器整套重建：设备一变，
                 // 挂在旧设备上的 D3D 设备管理器就作废了。
-                let rebuilt = (|| -> Result<(capture::Duplicator, encode::Encoder, Option<video_proc::Nv12Converter>)> {
-                    let outputs = d3d::enum_outputs()?;
-                    let info = outputs
-                        .get(output_index)
-                        .with_context(|| format!("没有第 {output_index} 个输出"))?;
-                    let (device, context) = d3d::create_device(&info.adapter)?;
-                    let new_dupl = capture::Duplicator::new(device, context, info)?;
-                    let new_cfg = EncodeConfig {
-                        codec: Codec::H264,
-                        width: new_dupl.width(),
-                        height: new_dupl.height(),
-                        fps,
-                        bitrate_bps: bitrate,
-                        keyframe_interval: 0,
-                    };
-                    let new_encoder =
-                        encode::Encoder::new(&new_cfg, encoder_pref, Some(new_dupl.device()))?;
-                    let new_conv = build_converter(&new_dupl, &new_encoder, fps)?;
-                    Ok((new_dupl, new_encoder, new_conv))
-                })();
+                let rebuilt = rebuild_pipeline(output_index, encoder_pref, fps, bitrate);
 
                 match rebuilt {
                     Ok((d, e, c)) => {
@@ -450,6 +465,35 @@ fn play(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// 整套重建：设备 → 复制器 → 编码器 → 转换器。
+///
+/// 必须整套来：设备一换，挂在旧设备上的 D3D 设备管理器就作废了，
+/// 只重建复制器会让编码器对着一个不存在的设备干活。
+fn rebuild_pipeline(
+    output_index: usize,
+    encoder_pref: encode::EncoderPreference,
+    fps: u32,
+    bitrate: u32,
+) -> Result<(capture::Duplicator, encode::Encoder, Option<video_proc::Nv12Converter>)> {
+    let outputs = d3d::enum_outputs()?;
+    let info = outputs
+        .get(output_index)
+        .with_context(|| format!("没有第 {output_index} 个输出"))?;
+    let (device, context) = d3d::create_device(&info.adapter)?;
+    let new_dupl = capture::Duplicator::new(device, context, info)?;
+    let new_cfg = EncodeConfig {
+        codec: Codec::H264,
+        width: new_dupl.width(),
+        height: new_dupl.height(),
+        fps,
+        bitrate_bps: bitrate,
+        keyframe_interval: 0,
+    };
+    let new_encoder = encode::Encoder::new(&new_cfg, encoder_pref, Some(new_dupl.device()))?;
+    let new_conv = build_converter(&new_dupl, &new_encoder, fps)?;
+    Ok((new_dupl, new_encoder, new_conv))
+}
+
 /// 硬件编码器要显存里的 NV12 纹理，软件编码器吃系统内存，所以转换器是可选的。
 fn build_converter(
     dupl: &capture::Duplicator,
@@ -467,6 +511,58 @@ fn build_converter(
         dupl.height(),
         fps,
     )?))
+}
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// 主循环心跳：给看门狗用。卡住了能知道卡在哪一步。
+pub(crate) static BEAT: AtomicU64 = AtomicU64::new(0);
+pub(crate) static STAGE: AtomicU64 = AtomicU64::new(0);
+
+fn stage_name(s: u64) -> &'static str {
+    match s {
+        1 => "acquire",
+        2 => "overlay",
+        3 => "convert",
+        4 => "encode",
+        5 => "send",
+        11 => "acquire:AcquireNextFrame",
+        12 => "acquire:copy",
+        13 => "acquire:pointer",
+        14 => "acquire:release",
+        _ => "idle",
+    }
+}
+
+/// 主循环 1.5 秒没动就报一次，3 秒就自杀。
+///
+/// 卡死的是 DXGI 的 `AcquireNextFrame`，它在锁屏、桌面切换、显示器休眠这些
+/// 场景下会嵌在内核里不返回，超时参数对它无效。进程内救不回来，
+/// 只能退出让外壳重启——反正状态都在收端，重连一次只是一帧的黑。
+fn spawn_watchdog() {
+    std::thread::spawn(|| {
+        let mut last = 0u64;
+        let mut stalled = 0u32;
+        loop {
+            std::thread::sleep(Duration::from_millis(1500));
+            let beat = BEAT.load(Ordering::Relaxed);
+            if beat == last {
+                stalled += 1;
+                if stalled == 1 {
+                    tracing::error!(
+                        stage = stage_name(STAGE.load(Ordering::Relaxed)),
+                        "主循环超过 1.5 秒没动"
+                    );
+                } else if stalled >= 2 {
+                    tracing::error!("主循环卡死，退出让外壳重启");
+                    std::process::exit(3);
+                }
+            } else {
+                stalled = 0;
+            }
+            last = beat;
+        }
+    });
 }
 
 fn now_us() -> i64 {
