@@ -1,0 +1,52 @@
+# 依赖与构建产物
+/target
+**/*.rs.bk
+*.pdb
+*.ilk
+
+# 编辑器
+.idea/
+.vscode/
+*.iml
+*.swp
+
+# 系统
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# 密钥与凭据
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+.env
+.env.*
+
+# Android
+*.apk
+*.aab
+*.keystore
+*.jks
+local.properties
+.gradle/
+build/
+captures/
+client-android/**/jniLibs/
+*.so
+*.so.debug
+
+# Rust 交叉编译中间产物
+.cargo/
+crates/**/target/
+
+# Godot
+.godot/
+*.translation
+export/
+*.tmp
+
+# 日志
+*.log
+logs/

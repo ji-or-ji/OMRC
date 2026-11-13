@@ -1,0 +1,31 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+    "crates/transport-lan",
+    "host-win",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+connecter-core = { path = "crates/core" }
+connecter-transport-lan = { path = "crates/transport-lan" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 1

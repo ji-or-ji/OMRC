@@ -1,0 +1,10 @@
+[package]
+name = "connecter-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "协议、传输抽象、编解码抽象与输入模型。零平台依赖。"
+
+[dependencies]
+thiserror.workspace = true
