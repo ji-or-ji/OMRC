@@ -25,6 +25,8 @@
 //! 32    ...   载荷，最大 MTU - 32 = 1168 字节
 //! ```
 
+use std::collections::{HashMap, VecDeque};
+
 use connecter_core::transport::EncodedFrame;
 
 /// 单片最大长度，含包头。取 1200 是为了在常见 MTU 1500 下留足余量，
@@ -89,18 +91,223 @@ impl Header {
     pub fn is_keyframe(&self) -> bool {
         self.flags & flags::KEYFRAME != 0
     }
+
+    pub fn is_last_slice(&self) -> bool {
+        self.flags & flags::LAST_SLICE != 0
+    }
 }
 
-/// 把一个编码帧切成若干分片。
+/// 重组完成的一帧。
+#[derive(Debug, Clone)]
+pub struct CompletedFrame {
+    pub frame_id: u64,
+    pub pts_us: u64,
+    pub keyframe: bool,
+    pub data: Vec<u8>,
+}
+
+/// 一个编码帧需要切成多少片。
+pub fn slice_count(len: usize) -> usize {
+    len.div_ceil(MAX_PAYLOAD)
+}
+
+/// 把一个编码帧切成若干分片，每片自带包头。
 ///
-/// TODO(W1): 实现。返回每个分片的完整字节（含包头）。
-pub fn fragment(_frame: &EncodedFrame) -> Vec<Vec<u8>> {
-    unimplemented!("W1")
+/// 返回的每片都是可以直接塞进 socket 的完整字节。
+pub fn fragment(frame: &EncodedFrame) -> Vec<Vec<u8>> {
+    if frame.data.is_empty() {
+        return Vec::new();
+    }
+
+    let total = slice_count(frame.data.len());
+    debug_assert!(total <= u16::MAX as usize, "单帧过大，分片数超出 u16");
+
+    let mut out = Vec::with_capacity(total);
+    for (i, chunk) in frame.data.chunks(MAX_PAYLOAD).enumerate() {
+        let mut f = 0u32;
+        if frame.keyframe {
+            f |= flags::KEYFRAME;
+        }
+        if i + 1 == total {
+            f |= flags::LAST_SLICE;
+        }
+
+        let h = Header {
+            frame_id: frame.id,
+            seq: i as u32,
+            slice_id: i as u16,
+            slice_count: total as u16,
+            flags: f,
+            pts_us: frame.pts_us,
+        };
+
+        let mut pkt = Vec::with_capacity(HEADER_LEN + chunk.len());
+        pkt.extend_from_slice(&h.encode());
+        pkt.extend_from_slice(chunk);
+        out.push(pkt);
+    }
+    out
+}
+
+#[derive(Debug)]
+struct FrameBuf {
+    slice_count: u16,
+    keyframe: bool,
+    pts_us: u64,
+    parts: Vec<Option<Vec<u8>>>,
+    got: u16,
+}
+
+/// 收端重组器。
+///
+/// 容忍乱序和重复，不骗人：缺片就是不完整，不会把半帧吐出去。
+/// 上层拿到 `None` 时可以用 `missing()` 发 NACK。
+#[derive(Debug)]
+pub struct Reassembler {
+    frames: HashMap<u64, FrameBuf>,
+    order: VecDeque<u64>,
+    max_inflight: usize,
+}
+
+impl Default for Reassembler {
+    fn default() -> Self {
+        Self::new(8)
+    }
+}
+
+impl Reassembler {
+    /// `max_inflight` 是同时等待重组的帧数上限。超了就丢最旧的那个，
+    /// 防止网络抖动时内存无限增长。
+    pub fn new(max_inflight: usize) -> Self {
+        Self {
+            frames: HashMap::new(),
+            order: VecDeque::new(),
+            max_inflight: max_inflight.max(1),
+        }
+    }
+
+    /// 喂一个原始包（含包头）。凑齐一帧就返回它。
+    pub fn push(&mut self, pkt: &[u8]) -> Option<CompletedFrame> {
+        let h = Header::decode(pkt)?;
+        if h.flags & flags::CONTROL != 0 {
+            return None;
+        }
+        if h.slice_count == 0 || h.slice_id >= h.slice_count {
+            return None;
+        }
+
+        if !self.frames.contains_key(&h.frame_id) {
+            self.evict_if_needed();
+            self.frames.insert(
+                h.frame_id,
+                FrameBuf {
+                    slice_count: h.slice_count,
+                    keyframe: h.is_keyframe(),
+                    pts_us: h.pts_us,
+                    parts: (0..h.slice_count).map(|_| None).collect(),
+                    got: 0,
+                },
+            );
+            self.order.push_back(h.frame_id);
+        }
+
+        let payload = &pkt[HEADER_LEN..];
+        let buf = self.frames.get_mut(&h.frame_id)?;
+
+        // 分片数不一致说明对端换了帧又复用了 frame_id，直接丢弃这一片。
+        if buf.slice_count != h.slice_count {
+            return None;
+        }
+
+        let slot = &mut buf.parts[h.slice_id as usize];
+        if slot.is_some() {
+            return None; // 重复片，忽略
+        }
+        *slot = Some(payload.to_vec());
+        buf.got += 1;
+
+        if buf.got < buf.slice_count {
+            return None;
+        }
+
+        // 凑齐了，按序拼起来
+        let buf = self.frames.remove(&h.frame_id)?;
+        self.order.retain(|id| *id != h.frame_id);
+
+        let mut data = Vec::with_capacity(buf.slice_count as usize * MAX_PAYLOAD);
+        for part in buf.parts {
+            data.extend_from_slice(&part?);
+        }
+
+        Some(CompletedFrame {
+            frame_id: h.frame_id,
+            pts_us: buf.pts_us,
+            keyframe: buf.keyframe,
+            data,
+        })
+    }
+
+    /// 某帧还缺哪些片。用来发 NACK。
+    pub fn missing(&self, frame_id: u64) -> Vec<u16> {
+        match self.frames.get(&frame_id) {
+            None => Vec::new(),
+            Some(buf) => buf
+                .parts
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.is_none())
+                .map(|(i, _)| i as u16)
+                .collect(),
+        }
+    }
+
+    /// 主动放弃一帧。收到更新的关键帧后调用，省得为旧帧白等。
+    pub fn drop_frame(&mut self, frame_id: u64) {
+        self.frames.remove(&frame_id);
+        self.order.retain(|id| *id != frame_id);
+    }
+
+    /// 丢弃比 `frame_id` 更旧的所有半成品。
+    pub fn drop_before(&mut self, frame_id: u64) {
+        let stale: Vec<u64> = self
+            .frames
+            .keys()
+            .copied()
+            .filter(|id| *id < frame_id)
+            .collect();
+        for id in stale {
+            self.drop_frame(id);
+        }
+    }
+
+    pub fn inflight(&self) -> usize {
+        self.frames.len()
+    }
+
+    fn evict_if_needed(&mut self) {
+        while self.frames.len() >= self.max_inflight {
+            match self.order.pop_front() {
+                Some(old) => {
+                    self.frames.remove(&old);
+                }
+                None => break,
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn frame(id: u64, len: usize, keyframe: bool) -> EncodedFrame {
+        EncodedFrame {
+            id,
+            pts_us: id * 16_666,
+            keyframe,
+            data: (0..len).map(|i| (i % 251) as u8).collect(),
+        }
+    }
 
     #[test]
     fn 包头往返一致() {
@@ -121,5 +328,115 @@ mod tests {
         let mut buf = [0u8; HEADER_LEN];
         buf[0..4].copy_from_slice(b"XXXX");
         assert_eq!(Header::decode(&buf), None);
+    }
+
+    #[test]
+    fn 分片数量按载荷上限计算() {
+        assert_eq!(slice_count(0), 0);
+        assert_eq!(slice_count(1), 1);
+        assert_eq!(slice_count(MAX_PAYLOAD), 1);
+        assert_eq!(slice_count(MAX_PAYLOAD + 1), 2);
+        assert_eq!(slice_count(MAX_PAYLOAD * 10), 10);
+    }
+
+    #[test]
+    fn 分片头信息正确() {
+        let f = frame(42, MAX_PAYLOAD * 3 + 100, true);
+        let pkts = fragment(&f);
+        assert_eq!(pkts.len(), 4);
+
+        for (i, pkt) in pkts.iter().enumerate() {
+            let h = Header::decode(pkt).expect("包头应可解析");
+            assert_eq!(h.frame_id, 42);
+            assert_eq!(h.slice_id as usize, i);
+            assert_eq!(h.slice_count, 4);
+            assert_eq!(h.seq as usize, i);
+            assert!(h.is_keyframe());
+            assert_eq!(h.is_last_slice(), i == 3);
+            assert!(pkt.len() <= MTU);
+        }
+    }
+
+    #[test]
+    fn 空帧不产生分片() {
+        assert!(fragment(&frame(1, 0, false)).is_empty());
+    }
+
+    #[test]
+    fn 乱序重组成功() {
+        let f = frame(7, MAX_PAYLOAD * 5, false);
+        let mut pkts = fragment(&f);
+        pkts.reverse();
+
+        let mut r = Reassembler::default();
+        let mut done = None;
+        for p in &pkts {
+            if let Some(x) = r.push(p) {
+                done = Some(x);
+            }
+        }
+        let done = done.expect("应能重组");
+        assert_eq!(done.frame_id, 7);
+        assert_eq!(done.data, f.data);
+        assert!(!done.keyframe);
+    }
+
+    #[test]
+    fn 缺片时不吐半帧并能报出缺失() {
+        let f = frame(9, MAX_PAYLOAD * 4, true);
+        let pkts = fragment(&f);
+
+        let mut r = Reassembler::default();
+        for (i, p) in pkts.iter().enumerate() {
+            if i == 2 {
+                continue; // 故意丢一片
+            }
+            assert!(r.push(p).is_none(), "不完整时不该返回帧");
+        }
+        assert_eq!(r.missing(9), vec![2]);
+        assert_eq!(r.inflight(), 1);
+    }
+
+    #[test]
+    fn 重复片被忽略且不破坏重组() {
+        let f = frame(11, MAX_PAYLOAD * 3, false);
+        let pkts = fragment(&f);
+
+        let mut r = Reassembler::default();
+        assert!(r.push(&pkts[0]).is_none());
+        assert!(r.push(&pkts[0]).is_none()); // 重复
+        assert!(r.push(&pkts[1]).is_none());
+        let done = r.push(&pkts[2]).expect("应能重组");
+        assert_eq!(done.data, f.data);
+    }
+
+    #[test]
+    fn 在途帧数有上限() {
+        let mut r = Reassembler::new(2);
+        // 三个都只发第一片，永远凑不齐
+        for id in 1..=3u64 {
+            let f = frame(id, MAX_PAYLOAD * 2, false);
+            let pkts = fragment(&f);
+            r.push(&pkts[0]);
+        }
+        assert_eq!(r.inflight(), 2, "超限时应丢掉最旧的");
+        assert!(r.missing(1).is_empty(), "最旧的帧应已被丢弃");
+    }
+
+    #[test]
+    fn 丢旧帧之后新帧照常重组() {
+        let old = frame(1, MAX_PAYLOAD * 2, false);
+        let new = frame(2, MAX_PAYLOAD * 2, true);
+
+        let mut r = Reassembler::default();
+        r.push(&fragment(&old)[0]);
+        r.drop_before(2);
+        assert_eq!(r.inflight(), 0);
+
+        let mut done = None;
+        for p in &fragment(&new) {
+            done = r.push(p).or(done);
+        }
+        assert_eq!(done.expect("新帧应能重组").frame_id, 2);
     }
 }
